@@ -1,0 +1,320 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function hasNonEmptyString(data, field) {
+      return field in data
+        && data[field] is string
+        && data[field].size() > 0;
+    }
+
+    function ownsUserList(listId) {
+      return exists(/databases/$(database)/documents/userLists/$(listId))
+        && get(/databases/$(database)/documents/userLists/$(listId)).data.userId
+          == request.auth.uid;
+    }
+
+    function ownsWorshipPlan(planId) {
+      return exists(/databases/$(database)/documents/worshipPlans/$(planId))
+        && get(/databases/$(database)/documents/worshipPlans/$(planId)).data.userId
+          == request.auth.uid;
+    }
+
+    function ownsUserTag(tagId) {
+      return exists(/databases/$(database)/documents/userTags/$(tagId))
+        && get(/databases/$(database)/documents/userTags/$(tagId)).data.userId
+          == request.auth.uid;
+    }
+
+    // ---- Shared hymn library ----
+    // Client-side deletion password is only an accidental-deletion barrier.
+    // These rules are the real access control: authenticated users only.
+    // Any signed-in user may edit/delete shared hymns and chord sheets
+    // (trusted-group model; not per-creator ownership).
+
+    match /hymns/{hymnId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && hasNonEmptyString(request.resource.data, 'name')
+        && hasNonEmptyString(request.resource.data, 'createdBy')
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.languages is list
+        && request.resource.data.categories is list
+        && request.resource.data.keys().hasAll([
+          'name',
+          'languages',
+          'categories',
+          'createdBy',
+          'createdAt',
+          'updatedAt'
+        ]);
+
+      // Any authenticated user may edit shared hymn metadata.
+      // createdBy / createdAt are immutable.
+      allow update: if isSignedIn()
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['createdBy', 'createdAt']);
+
+      allow delete: if isSignedIn();
+    }
+
+    match /chordSheets/{sheetId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && hasNonEmptyString(request.resource.data, 'hymnId')
+        && hasNonEmptyString(request.resource.data, 'imageUrl')
+        && hasNonEmptyString(request.resource.data, 'cloudinaryPublicId')
+        && hasNonEmptyString(request.resource.data, 'uploadedBy')
+        && request.resource.data.uploadedBy == request.auth.uid
+        && request.resource.data.order is number
+        && request.resource.data.keys().hasAll([
+          'hymnId',
+          'imageUrl',
+          'cloudinaryPublicId',
+          'originalFileName',
+          'order',
+          'uploadedBy',
+          'createdAt',
+          'updatedAt'
+        ]);
+
+      // Any authenticated user may edit/reorder shared chord-sheet metadata.
+      // Ownership and hymn linkage / Cloudinary public id are immutable
+      // (public id kept so unused Cloudinary assets can be found later).
+      allow update: if isSignedIn()
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['uploadedBy', 'createdAt', 'hymnId', 'cloudinaryPublicId']);
+
+      allow delete: if isSignedIn();
+    }
+
+    // ---- Personal data (owner only) ----
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId;
+
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['uid', 'createdAt']);
+
+      allow delete: if false;
+    }
+
+    // Personal favorites: favorites/{userId_hymnId}
+    // getDoc on a missing doc must be allowed for the owner's deterministic id,
+    // because resource is null and resource.data cannot be evaluated.
+    match /favorites/{favoriteId} {
+      function favoriteIdOwnedByAuth() {
+        return isSignedIn()
+          && favoriteId.size() > request.auth.uid.size() + 1
+          && favoriteId[0:request.auth.uid.size()] == request.auth.uid
+          && favoriteId[request.auth.uid.size():request.auth.uid.size() + 1] == '_';
+      }
+
+      function favoriteDocMatchesAuthUser() {
+        return resource.data.userId == request.auth.uid
+          && favoriteId == request.auth.uid + '_' + resource.data.hymnId;
+      }
+
+      allow get: if favoriteIdOwnedByAuth()
+        && (resource == null || favoriteDocMatchesAuthUser());
+
+      allow list: if isSignedIn()
+        && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'hymnId')
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && favoriteId == request.auth.uid + '_' + request.resource.data.hymnId
+        && request.resource.data.keys().hasAll(['userId', 'hymnId', 'createdAt']);
+
+      allow delete: if isSignedIn()
+        && favoriteDocMatchesAuthUser();
+
+      allow update: if false;
+    }
+
+    match /userTags/{tagId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'name')
+        && hasNonEmptyString(request.resource.data, 'userId');
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'createdAt']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Personal tag links: userHymnTags/{userId_hymnId_tagId}
+    match /userHymnTags/{linkId} {
+      function hymnTagDocMatchesAuthUser() {
+        return resource.data.userId == request.auth.uid
+          && linkId == request.auth.uid
+            + '_' + resource.data.hymnId
+            + '_' + resource.data.tagId;
+      }
+
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'hymnId')
+        && hasNonEmptyString(request.resource.data, 'tagId')
+        && linkId == request.auth.uid
+          + '_' + request.resource.data.hymnId
+          + '_' + request.resource.data.tagId
+        && ownsUserTag(request.resource.data.tagId)
+        && request.resource.data.keys().hasAll(['userId', 'hymnId', 'tagId']);
+
+      allow delete: if isSignedIn() && hymnTagDocMatchesAuthUser();
+
+      allow update: if false;
+    }
+
+    // Personal chord-sheet notes: chordSheetNotes/{userId_chordSheetId}
+    match /chordSheetNotes/{noteId} {
+      function noteIdOwnedByAuth() {
+        return isSignedIn()
+          && noteId.size() > request.auth.uid.size() + 1
+          && noteId[0:request.auth.uid.size()] == request.auth.uid
+          && noteId[request.auth.uid.size():request.auth.uid.size() + 1] == '_';
+      }
+
+      function noteDocMatchesAuthUser() {
+        return resource.data.userId == request.auth.uid
+          && noteId == request.auth.uid + '_' + resource.data.chordSheetId;
+      }
+
+      allow get: if noteIdOwnedByAuth()
+        && (resource == null || noteDocMatchesAuthUser());
+
+      allow list: if isSignedIn()
+        && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'chordSheetId')
+        && request.resource.data.content is string
+        && noteId == request.auth.uid + '_' + request.resource.data.chordSheetId
+        && request.resource.data.keys().hasAll([
+          'chordSheetId',
+          'userId',
+          'content',
+          'updatedAt'
+        ]);
+
+      allow update: if isSignedIn()
+        && noteDocMatchesAuthUser()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.chordSheetId == resource.data.chordSheetId
+        && request.resource.data.content is string
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'chordSheetId']);
+
+      allow delete: if isSignedIn()
+        && noteDocMatchesAuthUser();
+    }
+
+    match /userLists/{listId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'name');
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'createdAt']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /userListItems/{itemId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      // Parent list must belong to the signer — blocks planting items on
+      // another user's listId (which would break their list queries).
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'listId')
+        && hasNonEmptyString(request.resource.data, 'hymnId')
+        && request.resource.data.order is number
+        && ownsUserList(request.resource.data.listId);
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.listId == resource.data.listId
+        && request.resource.data.hymnId == resource.data.hymnId
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'listId', 'hymnId', 'createdAt']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /worshipPlans/{planId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'name');
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'createdAt']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /worshipPlanItems/{itemId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && hasNonEmptyString(request.resource.data, 'userId')
+        && hasNonEmptyString(request.resource.data, 'planId')
+        && hasNonEmptyString(request.resource.data, 'type')
+        && request.resource.data.order is number
+        && ownsWorshipPlan(request.resource.data.planId);
+
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.planId == resource.data.planId
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['userId', 'planId', 'createdAt']);
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
